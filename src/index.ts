@@ -114,6 +114,138 @@ server.tool(
   }
 );
 
+// --- WORKFLOW AUTOMATION TOOLS ---
+
+server.tool(
+  "get_next_task",
+  "Get the next actionable task based on dependencies and priority. Returns the task details and recommended agent.",
+  {},
+  async () => {
+    const allTasks = await github.listIssues("open", ["task"]);
+    
+    // Filter to tasks that are not blocked or in-progress
+    const availableTasks = allTasks.filter(task => 
+      !task.labels.includes("status:in-progress") && 
+      !task.labels.includes("status:blocked") &&
+      !task.labels.includes("status:review")
+    );
+
+    if (availableTasks.length === 0) {
+      return {
+        content: [{ type: "text", text: "No actionable tasks available. All tasks are either in progress, blocked, or awaiting review." }],
+      };
+    }
+
+    // Get the first available task (you can add priority logic here)
+    const nextTask = availableTasks[0];
+    
+    // Determine recommended agent based on task status and type
+    let recommendedAgent = "developer";
+    if (!nextTask.labels.includes("status:designed")) {
+      recommendedAgent = "architect";
+    }
+
+    const response = `**Next Task:** #${nextTask.number} - ${nextTask.title}\n**Status:** Ready to start\n**Recommended Agent:** ${recommendedAgent}\n**Description:** ${nextTask.body}`;
+    
+    return {
+      content: [{ type: "text", text: response }],
+    };
+  }
+);
+
+server.tool(
+  "start_task",
+  "Mark a task as in-progress and assign it to the current agent role.",
+  {
+    taskId: z.number().describe("The task number to start"),
+    agentRole: z.enum(["architect", "developer", "tech-lead", "qa", "devops"]).describe("The role starting this task"),
+  },
+  async ({ taskId, agentRole }) => {
+    await github.updateIssue(taskId, { labels: ["task", "status:in-progress"] });
+    await github.addComment(taskId, `Started by **${agentRole}** at ${new Date().toISOString()}`);
+    
+    return {
+      content: [{ type: "text", text: `Task #${taskId} is now in progress. Assigned to: ${agentRole}` }],
+    };
+  }
+);
+
+server.tool(
+  "request_review",
+  "Request a review from another agent role. Changes task status to 'review'.",
+  {
+    taskId: z.number().describe("The task number to request review for"),
+    reviewerRole: z.enum(["tech-lead", "qa", "architect", "devops"]).describe("The role to review this task"),
+    notes: z.string().optional().describe("Additional notes for the reviewer"),
+  },
+  async ({ taskId, reviewerRole, notes }) => {
+    await github.updateIssue(taskId, { labels: ["task", "status:review"] });
+    const comment = `**Review Requested**\n\nReviewer: **${reviewerRole}**\n${notes ? `\nNotes: ${notes}` : ""}`;
+    await github.addComment(taskId, comment);
+    
+    return {
+      content: [{ type: "text", text: `Review requested from ${reviewerRole} for Task #${taskId}` }],
+    };
+  }
+);
+
+server.tool(
+  "approve_task",
+  "Approve a task after review. This closes the task and marks it as complete.",
+  {
+    taskId: z.number().describe("The task number to approve"),
+    approverRole: z.enum(["tech-lead", "qa", "product-owner"]).describe("The role approving this task"),
+    feedback: z.string().optional().describe("Optional approval feedback"),
+  },
+  async ({ taskId, approverRole, feedback }) => {
+    await github.updateIssue(taskId, { state: "closed", labels: ["task", "status:approved"] });
+    const comment = `✅ **Approved by ${approverRole}**\n${feedback ? `\nFeedback: ${feedback}` : ""}`;
+    await github.addComment(taskId, comment);
+    
+    return {
+      content: [{ type: "text", text: `Task #${taskId} approved and closed by ${approverRole}` }],
+    };
+  }
+);
+
+server.tool(
+  "reject_task",
+  "Reject a task and request changes. Moves task back to in-progress.",
+  {
+    taskId: z.number().describe("The task number to reject"),
+    reviewerRole: z.enum(["tech-lead", "qa", "architect"]).describe("The role rejecting this task"),
+    reason: z.string().describe("Reason for rejection and required changes"),
+  },
+  async ({ taskId, reviewerRole, reason }) => {
+    await github.updateIssue(taskId, { labels: ["task", "status:in-progress", "needs-changes"] });
+    const comment = `❌ **Changes Requested by ${reviewerRole}**\n\n${reason}`;
+    await github.addComment(taskId, comment);
+    
+    return {
+      content: [{ type: "text", text: `Task #${taskId} rejected. Changes requested by ${reviewerRole}` }],
+    };
+  }
+);
+
+server.tool(
+  "block_task",
+  "Mark a task as blocked due to external dependencies.",
+  {
+    taskId: z.number().describe("The task number to block"),
+    reason: z.string().describe("Reason for blocking (e.g., 'Waiting for API key')"),
+    blockedBy: z.string().optional().describe("What/who is blocking this task"),
+  },
+  async ({ taskId, reason, blockedBy }) => {
+    await github.updateIssue(taskId, { labels: ["task", "status:blocked"] });
+    const comment = `🚫 **Task Blocked**\n\nReason: ${reason}\n${blockedBy ? `Blocked by: ${blockedBy}` : ""}`;
+    await github.addComment(taskId, comment);
+    
+    return {
+      content: [{ type: "text", text: `Task #${taskId} marked as blocked` }],
+    };
+  }
+);
+
 // --- PROMPTS (PERSONAS) ---
 
 server.prompt(
@@ -199,6 +331,76 @@ server.prompt(
           content: {
             type: "text",
             text: `You are the QA Engineer. Your goal is to test the application and log bugs using the 'report_bug' tool.`,
+          },
+        },
+      ],
+    };
+  }
+);
+
+server.prompt(
+  "persona-tech-lead",
+  "Act as Tech Lead. Focus on code review, team coordination, and unblocking developers.",
+  {
+    taskId: z.string().optional().describe("The Task ID to review"),
+  },
+  async ({ taskId }) => {
+    let context = "";
+    if (taskId) {
+      const issue = await github.getIssue(parseInt(taskId));
+      context = `Reviewing Task #${issue.number}: ${issue.title}\n\nDescription:\n${issue.body}`;
+    }
+    
+    const tasksInReview = await github.listIssues("open", ["task", "status:review"]);
+    const reviewList = tasksInReview.map(t => `- #${t.number}: ${t.title}`).join("\n");
+    
+    return {
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: `You are the Tech Lead. Your responsibilities:
+- Review code quality and design decisions
+- Approve or reject tasks using 'approve_task' or 'reject_task'
+- Unblock developers using 'block_task' when needed
+- Coordinate between roles
+
+Tasks awaiting your review:
+${reviewList || "None"}
+
+${context}`,
+          },
+        },
+      ],
+    };
+  }
+);
+
+server.prompt(
+  "persona-devops",
+  "Act as DevOps Engineer. Focus on deployment, CI/CD, and infrastructure.",
+  {},
+  async () => {
+    const approvedTasks = await github.listIssues("closed", ["task", "status:approved"]);
+    const deploymentList = approvedTasks.slice(0, 5).map(t => `- #${t.number}: ${t.title}`).join("\n");
+    
+    return {
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: `You are the DevOps Engineer. Your responsibilities:
+- Deploy approved code to staging and production
+- Set up CI/CD pipelines
+- Monitor application health
+- Manage infrastructure
+
+Recently approved tasks ready for deployment:
+${deploymentList || "None"}
+
+Use 'add_comment' to log deployment status.`,
           },
         },
       ],
