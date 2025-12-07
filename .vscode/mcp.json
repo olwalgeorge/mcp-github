@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "mcp2": {
+      "command": "node",
+      "args": ["--env-file=${workspaceFolder}/.env", "${workspaceFolder}/build/index.js"]
+    }
+  }
+}
